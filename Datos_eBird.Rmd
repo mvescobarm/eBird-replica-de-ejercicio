@@ -1,0 +1,857 @@
+---
+title: "Datos_eBird"
+author: "Victoria Escobar"
+date: "2024-03-01"
+output:
+  html_document:
+    toc: yes
+    toc_depth: 3
+    toc_float: yes
+    collapsed: yes
+    smooth_scroll: yes
+    theme: journal
+    highlight: kate
+    df_print: paged
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Instalación de paquetes requeridos 
+
+Se emplearán diversos paquetes de R para acceder a datos de eBird, trabajar con datos espaciales, realizar procesamiento y manipulación de datos, así como para llevar a cabo el entrenamiento de modelos.
+
+```{r}
+if (!requireNamespace("remotes", quietly = TRUE)) {
+  install.packages("remotes")
+}
+remotes::install_github("ebird/ebird-best-practices")
+```
+## Datos SIG
+
+A lo largo de la guía, se generarán mapas de distribuciones de especies, utilizando datos SIG para las fronteras políticas. Natural Earth se destaca como una fuente integral de datos SIG rasterizados y vectoriales, facilitando la creación de mapas cartográficos profesionales.
+
+```{r}
+library(dplyr)
+library(rnaturalearth)
+library(sf)
+
+# file to save spatial data
+gpkg_file <- "data/gis-data.gpkg"
+dir.create(dirname(gpkg_file), showWarnings = FALSE, recursive = TRUE)
+
+# political boundaries
+# land border with lakes removed
+ne_land <- ne_download(scale = 50, category = "cultural",
+                       type = "admin_0_countries_lakes",
+                       returnclass = "sf") |>
+  filter(CONTINENT %in% c("North America", "South America")) |>
+  st_set_precision(1e6) |>
+  st_union()
+# country boundaries
+ne_countries <- ne_download(scale = 50, category = "cultural",
+                       type = "admin_0_countries_lakes",
+                       returnclass = "sf") |>
+  select(country = ADMIN, country_code = ISO_A2)
+# state boundaries for united states
+ne_states <- ne_download(scale = 50, category = "cultural",
+                       type = "admin_1_states_provinces",
+                       returnclass = "sf") |> 
+  filter(iso_a2 == "US") |> 
+  select(state = name, state_code = iso_3166_2)
+# country lines
+# downloaded globally then filtered to north america with st_intersect()
+ne_country_lines <- ne_download(scale = 50, category = "cultural",
+                                type = "admin_0_boundary_lines_land",
+                                returnclass = "sf") |> 
+  st_geometry()
+lines_on_land <- st_intersects(ne_country_lines, ne_land, sparse = FALSE) |>
+  as.logical()
+ne_country_lines <- ne_country_lines[lines_on_land]
+# states, north america
+ne_state_lines <- ne_download(scale = 50, category = "cultural",
+                              type = "admin_1_states_provinces_lines",
+                              returnclass = "sf") |>
+  filter(ADM0_A3 %in% c("USA", "CAN")) |>
+  mutate(iso_a2 = recode(ADM0_A3, USA = "US", CAN = "CAN")) |> 
+  select(country = ADM0_NAME, country_code = iso_a2)
+
+# save all layers to a geopackage
+unlink(gpkg_file)
+write_sf(ne_land, gpkg_file, "ne_land")
+write_sf(ne_countries, gpkg_file, "ne_countries")
+write_sf(ne_states, gpkg_file, "ne_states")
+write_sf(ne_country_lines, gpkg_file, "ne_country_lines")
+write_sf(ne_state_lines, gpkg_file, "ne_state_lines")
+```
+
+Se revisa la versión de R.
+
+```{r}
+devtools::session_info()
+```
+## Importar datos de eBird a R
+
+Lista de verificación de Georgia (donde anotan todos los pájaros que ven).
+ 
+```{r}
+library(auk)
+library(dplyr)
+library(ggplot2)
+library(gridExtra)
+library(lubridate)
+library(readr)
+library(sf)
+
+f_sed <- "C:/Users/victo/OneDrive - PUJ Cali/Documentos/Maestría/2. Proyecto aplicado/Replica datos eBird/ebd_US-GA_woothr_smp_relOct-2023/ebd_US-GA_woothr_smp_relOct-2023_sampling.txt"
+checklists <- read_sampling(f_sed)
+glimpse(checklists)
+```
+
+
+```{r}
+# Filtrar las listas de verificación con información de distancia
+checklists_con_distancia <- checklists %>% 
+  filter(!is.na(effort_distance_km))
+
+# Crear un histograma
+histograma_distancias <- ggplot(checklists_con_distancia, aes(x = effort_distance_km)) +
+  geom_histogram(binwidth = 10, fill = "blue", color = "black", alpha = 0.7) +
+  labs(title = "Distribución de Distancias Recorridas",
+       x = "Distancia Recorrida (km)",
+       y = "Frecuencia") +
+  theme_minimal()
+
+# Mostrar el histograma
+print(histograma_distancias)
+```
+Contiene todas las observaciones (donde anotan todo lo que ven, incluso si no ven nada).
+
+```{r}
+f_ebd <- "C:/Users/victo/OneDrive - PUJ Cali/Documentos/Maestría/2. Proyecto aplicado/Replica datos eBird/ebd_US-GA_woothr_smp_relOct-2023/ebd_US-GA_woothr_smp_relOct-2023.txt"
+observations <- read_ebd(f_ebd)
+glimpse(observations)
+```
+
+## Listas de verificación compartidas
+
+```{r}
+checklists_shared <- read_sampling(f_sed, unique = FALSE)
+# identify shared checklists
+checklists_shared |> 
+  filter(!is.na(group_identifier)) |> 
+  arrange(group_identifier) |> 
+  select(sampling_event_identifier, group_identifier)
+```
+```{r}
+checklists_unique <- auk_unique(checklists_shared, checklists_only = TRUE)
+nrow(checklists_shared)
+```
+```{r}
+nrow(checklists_unique)
+```
+```{r}
+head(checklists_unique$checklist_id)
+```
+
+```{r}
+tail(checklists_unique$checklist_id)
+```
+```{r}
+# importar uno de los conjuntos de datos de ejemplo de auk sin acumular taxonomía
+obs_ex <- system.file("extdata/ebd-rollup-ex.txt", package = "auk") |> 
+  read_ebd(rollup = FALSE)
+# rollup taxonomy
+obs_ex_rollup <- auk_rollup(obs_ex)
+
+# identificar las categorías taxonómicas presentes en cada conjunto de datos
+unique(obs_ex$category)
+```
+
+```{r}
+unique(obs_ex_rollup$category)
+```
+```{r}
+#sin resumen, hay cuatro observaciones
+obs_ex |>
+  filter(common_name == "Yellow-rumped Warbler") |> 
+  select(checklist_id, category, common_name, subspecies_common_name, 
+         observation_count)
+```
+
+```{r}
+#con resumen, se han combinado
+obs_ex_rollup |>
+  filter(common_name == "Yellow-rumped Warbler") |> 
+  select(checklist_id, category, common_name, observation_count)
+```
+## Filtrado para esrudiar región y temporada 
+
+El código facilita la selección exclusiva de la información relevante sobre el Wood Thrush en Georgia, abarcando los últimos 10 años y limitándose a las listas de verificación completas durante el mes de junio. Este proceso se asemeja a la analogía de tener un libro extenso y extraer únicamente las páginas esenciales para el estudio en cuestión.
+
+```{r}
+# filter the checklist data
+checklists <- checklists |> 
+  filter(all_species_reported,
+         between(year(observation_date), 2014, 2023),
+         month(observation_date) == 6)
+
+# filter the observation data
+observations <- observations |> 
+  filter(all_species_reported,
+         between(year(observation_date), 2014, 2023),
+         month(observation_date) == 6)
+```
+
+Se está asegurando de incluir únicamente las observaciones de aves en tierra, excluyendo aquellas en agua. Esto se logra mediante la aplicación de un límite geográfico especial que define la ubicación de Georgia y considerando solo las observaciones cercanas. El proceso se asemeja a aplicar un filtro en un mapa para retener únicamente la información de interés. Para llevar a cabo esta tarea, se utiliza un "polígono límite", una forma específica en el mapa que delimita con precisión la ubicación de Georgia, y se establece un criterio de inclusión para observaciones dentro de un radio de 1 kilómetro de distancia de Georgia.
+
+```{r}
+# convert checklist locations to points geometries
+checklists_sf <- checklists |> 
+  select(checklist_id, latitude, longitude) |> 
+  st_as_sf(coords = c("longitude", "latitude"), crs = 4326)
+
+# boundary of study region, buffered by 1 km
+study_region_buffered <- read_sf("data/gis-data.gpkg", layer = "ne_states") |>
+  filter(state_code == "US-GA") |>
+  st_transform(crs = st_crs(checklists_sf)) |>
+  st_buffer(dist = 1000)
+
+# spatially subset the checklists to those in the study region
+in_region <- checklists_sf[study_region_buffered, ]
+
+# join to checklists and observations to remove checklists outside region
+checklists <- semi_join(checklists, in_region, by = "checklist_id")
+observations <- semi_join(observations, in_region, by = "checklist_id")
+```
+
+Se esta siendo cuidadosos y solo se guarda la información que todos están de acuerdo en haber visto, para que todo sea claro y no haya confusión. ¡Es como asegurarse de que todos estan hablando de lo mismo!
+
+```{r}
+# remove observations without matching checklists
+observations <- semi_join(observations, checklists, by = "checklist_id")
+```
+
+En resumen, aunque se observe que alguien ha registrado avistamientos de un pájaro en varias ocasiones, si no se tiene conocimiento de cuántas salidas se realizaron en total, no es posible afirmar con certeza si ese pájaro es común o raro. Se asemeja a la situación en la que tus amigos salen en numerosas ocasiones, pero solo registran la presencia de ese pájaro en algunas de esas salidas.
+
+El procedimiento para realizar esto se denomina "relleno cero" de los datos. Se utiliza una herramienta denominada auk_zerofill() para combinar la lista de avistamientos de aves con la lista completa de observaciones, permitiendo así obtener datos que indican qué pájaros fueron avistados y cuáles no.
+
+```{r}
+zf <- auk_zerofill(observations, checklists, collapse = TRUE)
+```
+
+A veces, cuando tus amigos escriben las horas o las distancias que caminaron, pueden estar escritas de una manera que no es tan fácil de entender. Entonces, usamos otra herramienta para convertir esas horas en números más fáciles de manejar (de 0 a 24), poner la distancia en 0 si están quietos, y hasta calculamos la velocidad.
+
+Y, oh, a veces tus amigos escriben una "X" en lugar de decir cuántos pájaros vieron. Así que, para que sea más fácil trabajar con los datos, convertimos esas "X" en un espacio en blanco especial llamado "NA", que significa que no sabemos cuántos pájaros vieron.
+
+```{r}
+# function to convert time observation to hours since midnight
+time_to_decimal <- function(x) {
+  x <- hms(x, quiet = TRUE)
+  hour(x) + minute(x) / 60 + second(x) / 3600
+}
+
+# clean up variables
+zf <- zf |> 
+  mutate(
+    # convert count to integer and X to NA
+    # ignore the warning "NAs introduced by coercion"
+    observation_count = as.integer(observation_count),
+    # effort_distance_km to 0 for stationary counts
+    effort_distance_km = if_else(protocol_type == "Stationary", 
+                                 0, effort_distance_km),
+    # convert duration to hours
+    effort_hours = duration_minutes / 60,
+    # speed km/h
+    effort_speed_kmph = effort_distance_km / effort_hours,
+    # convert time to decimal hours since midnight
+    hours_of_day = time_to_decimal(time_observations_started),
+    # split date into year and day of year
+    year = year(observation_date),
+    day_of_year = yday(observation_date)
+  )
+```
+Cada persona cuenta los pájaros de manera diferente, y algunos caminan mucho más que otros. Entonces, para que todos podamos contar los pájaros de una manera más justa, decidimos poner algunas reglas.
+
+Decimos que solo vamos a contar los pájaros cuando:
+
+Caminamos menos de 6 horas.
+Caminamos menos de 10 kilómetros.
+No vamos muy rápido, menos de 100 km/h.
+Hay 10 personas o menos contando pájaros juntas.
+Estas reglas nos ayudan a asegurarnos de que todos estemos contando los pájaros de manera similar.
+
+```{r}
+# additional filtering
+zf_filtered <- zf |> 
+  filter(protocol_type %in% c("Stationary", "Traveling"),
+         effort_hours <= 6,
+         effort_distance_km <= 10,
+         effort_speed_kmph <= 100,
+         number_observers <= 10)
+```
+
+La gran mayoría de las listas de verificación están muy por debajo del límite de 6 horas, y más de la mitad tienen menos de una hora de duración.
+
+```{r}
+ggplot(zf_filtered) +
+  aes(x = effort_hours) +
+  geom_histogram(binwidth = 0.5, 
+                 aes(y = after_stat(count / sum(count)))) +
+  scale_y_continuous(limits = c(0, NA), labels = scales::label_percent()) +
+  labs(x = "Duration [hours]",
+       y = "% of eBird checklists",
+       title = "Distribution of eBird checklist duration")
+```
+**Conjunto de Entrenamiento (80%):**
+
+Es como el conjunto de preguntas que practicamos. Aquí, el modelo aprende cómo responder a diferentes situaciones. Usamos el 80% de nuestros datos para esto.
+
+**Conjunto de Pruebas (20%):**
+
+Este es nuestro conjunto de preguntas reales. Usamos el 20% restante de nuestros datos para ver qué tan bien puede hacer el modelo en preguntas que no ha visto antes.
+
+```{r}
+zf_filtered$type <- if_else(runif(nrow(zf_filtered)) <= 0.8, "train", "test")
+# confirm the proportion in each set is correct
+table(zf_filtered$type) / nrow(zf_filtered)
+```
+Queremos hacer espacio y quedarnos solo con lo que realmente necesitamos. 
+
+```{r}
+checklists <- zf_filtered |> 
+  select(checklist_id, observer_id, type,
+         observation_count, species_observed, 
+         state_code, locality_id, latitude, longitude,
+         protocol_type, all_species_reported,
+         observation_date, year, day_of_year,
+         hours_of_day, 
+         effort_hours, effort_distance_km, effort_speed_kmph,
+         number_observers)
+write_csv(checklists, "data/checklists-zf_woothr_jun_us-ga.csv", na = "")
+```
+
+Vale la pena explorar el conjunto de datos para ver con qué estamos trabajando. Este mapa utiliza datos SIG disponibles. 
+
+## Los datos usando mapas y gráficos
+
+*Mapa del Sesgo Espacial:*
+
+Imagina que tienes un mapa gigante de Georgia y colocas un punto cada vez que alguien ve aves. Pero, ¡sorpresa!, hay muchos puntos alrededor de Atlanta, la ciudad más grande. Esto es lo que llamamos "sesgo espacial". Significa que más personas en esa área informan aves que en otros lugares. Puede ser porque hay más observadores allí o porque es más fácil ver aves en la ciudad. Este mapa nos ayuda a entender cómo están distribuidos los datos en el espacio.
+
+*Histogramas y Gráficos de Frecuencia:*
+
+Ahora, pensemos en las personas que salen a observar aves. Hacemos gráficos que nos muestran cosas como:
+
+¿A qué hora del día la mayoría de la gente sale? (histograma)
+¿Cuánto tiempo pasan observando aves? (histograma)
+¿Cómo cambia la probabilidad de ver una especie según cuánto tiempo y esfuerzo ponen? (gráfico de frecuencia de detección)
+Es como si estuviéramos estudiando cómo la gente busca tesoros. ¿Van más de día o de noche? ¿Cuánto tiempo buscan? ¿Hay lugares donde encuentran tesoros más fácilmente?
+
+```{r}
+# load gis data
+ne_land <- read_sf("data/gis-data.gpkg", "ne_land") |> 
+  st_geometry()
+ne_country_lines <- read_sf("data/gis-data.gpkg", "ne_country_lines") |> 
+  st_geometry()
+ne_state_lines <- read_sf("data/gis-data.gpkg", "ne_state_lines") |> 
+  st_geometry()
+study_region <- read_sf("data/gis-data.gpkg", "ne_states") |> 
+  filter(state_code == "US-GA") |> 
+  st_geometry()
+
+# prepare ebird data for mapping
+checklists_sf <- checklists |> 
+  # convert to spatial points
+  st_as_sf(coords = c("longitude", "latitude"), crs = 4326) |> 
+  select(species_observed)
+
+# map
+par(mar = c(0.25, 0.25, 4, 0.25))
+# set up plot area
+plot(st_geometry(checklists_sf), 
+     main = "Wood Thrush eBird Observations\nJune 2014-2023",
+     col = NA, border = NA)
+# contextual gis data
+plot(ne_land, col = "#cfcfcf", border = "#888888", lwd = 0.5, add = TRUE)
+plot(study_region, col = "#e6e6e6", border = NA, add = TRUE)
+plot(ne_state_lines, col = "#ffffff", lwd = 0.75, add = TRUE)
+plot(ne_country_lines, col = "#ffffff", lwd = 1.5, add = TRUE)
+# ebird observations
+# not observed
+plot(filter(checklists_sf, !species_observed),
+     pch = 19, cex = 0.1, col = alpha("#555555", 0.25),
+     add = TRUE)
+# observed
+plot(filter(checklists_sf, species_observed),
+     pch = 19, cex = 0.3, col = alpha("#4daf4a", 1),
+     add = TRUE)
+# legend
+legend("bottomright", bty = "n",
+       col = c("#555555", "#4daf4a"),
+       legend = c("eBird checklist", "Wood Thrush sighting"),
+       pch = 19)
+box()
+```
+¡Vamos a explorar la hora del día en la que la gente ve aves!
+
+*Picos de Detección:*
+
+Piensa en las aves como tesoros. Algunas aves son más fáciles de encontrar en ciertos momentos del día. Por ejemplo, temprano en la mañana, durante el coro del amanecer, es como el mejor momento para buscar tesoros. 
+
+*Intervalos de 1 Hora:*
+
+Ahora, para entender cuándo la gente encuentra más aves, dividimos el día en pedacitos de 1 hora. Es como dividir el día en muchas partes pequeñas para ver en cuál de ellas es más probable encontrar tesoros.
+
+*Condiciones para Graficar:*
+
+No queremos hacer trampa, así que solo mostraremos las horas en las que al menos 100 personas han buscado tesoros. Esto asegura que nuestras estimaciones sean confiables.
+
+```{r}
+# summarize data by hourly bins
+breaks <- seq(0, 24)
+labels <- breaks[-length(breaks)] + diff(breaks) / 2
+checklists_time <- checklists |> 
+  mutate(hour_bins = cut(hours_of_day, 
+                         breaks = breaks, 
+                         labels = labels,
+                         include.lowest = TRUE),
+         hour_bins = as.numeric(as.character(hour_bins))) |> 
+  group_by(hour_bins) |> 
+  summarise(n_checklists = n(),
+            n_detected = sum(species_observed),
+            det_freq = mean(species_observed))
+
+# histogram
+g_tod_hist <- ggplot(checklists_time) +
+  aes(x = hour_bins, y = n_checklists) +
+  geom_segment(aes(xend = hour_bins, y = 0, yend = n_checklists),
+               color = "grey50") +
+  geom_point() +
+  scale_x_continuous(breaks = seq(0, 24, by = 3), limits = c(0, 24)) +
+  scale_y_continuous(labels = scales::comma) +
+  labs(x = "Hours since midnight",
+       y = "# checklists",
+       title = "Distribution of observation start times")
+
+# frequency of detection
+g_tod_freq <- ggplot(checklists_time |> filter(n_checklists > 100)) +
+  aes(x = hour_bins, y = det_freq) +
+  geom_line() +
+  geom_point() +
+  scale_x_continuous(breaks = seq(0, 24, by = 3), limits = c(0, 24)) +
+  scale_y_continuous(labels = scales::percent) +
+  labs(x = "Hours since midnight",
+       y = "% checklists with detections",
+       title = "Detection frequency")
+
+# combine
+grid.arrange(g_tod_hist, g_tod_freq)
+```
+Como era de esperar, la detectabilidad del zorzal común es mayor temprano en la mañana y disminuye rápidamente a medida que avanza el día. La mayoría de los envíos de listas de verificación también se realizan por la mañana; sin embargo, hay un número razonable de listas de verificación entre las 6 a. m. y las 9 p. m. Es en esta región donde las estimaciones de nuestro modelo serán más confiables.
+
+Ahora, es como si estuviéramos estudiando a diferentes buscadores de tesoros. Algunos buscan durante solo un rato, mientras que otros buscan durante mucho más tiempo. Queremos ver cómo varía esto entre las personas que observan aves.
+
+```{r}
+# summarize data by hour long bins
+breaks <- seq(0, 6)
+labels <- breaks[-length(breaks)] + diff(breaks) / 2
+checklists_duration <- checklists |> 
+  mutate(duration_bins = cut(effort_hours, 
+                             breaks = breaks, 
+                             labels = labels,
+                             include.lowest = TRUE),
+         duration_bins = as.numeric(as.character(duration_bins))) |> 
+  group_by(duration_bins) |> 
+  summarise(n_checklists = n(),
+            n_detected = sum(species_observed),
+            det_freq = mean(species_observed))
+
+# histogram
+g_duration_hist <- ggplot(checklists_duration) +
+  aes(x = duration_bins, y = n_checklists) +
+  geom_segment(aes(xend = duration_bins, y = 0, yend = n_checklists),
+               color = "grey50") +
+  geom_point() +
+  scale_x_continuous(breaks = breaks) +
+  scale_y_continuous(labels = scales::comma) +
+  labs(x = "Checklist duration [hours]",
+       y = "# checklists",
+       title = "Distribution of checklist durations")
+
+# frequency of detection
+g_duration_freq <- ggplot(checklists_duration |> filter(n_checklists > 100)) +
+  aes(x = duration_bins, y = det_freq) +
+  geom_line() +
+  geom_point() +
+  scale_x_continuous(breaks = breaks) +
+  scale_y_continuous(labels = scales::percent) +
+  labs(x = "Checklist duration [hours]",
+       y = "% checklists with detections",
+       title = "Detection frequency")
+
+# combine
+grid.arrange(g_duration_hist, g_duration_freq)
+```
+
+La mayoría de las listas de verificación duran una hora o menos y hay una rápida disminución en la frecuencia de las listas de verificación a medida que aumenta la duración. Pero aquí hay algo interesante: a medida que las búsquedas son más largas, hay una mayor probabilidad de encontrar al zorzal. Es como si las personas que buscan durante más tiempo tienen más posibilidades de encontrar a nuestro amigo el zorzal. Aunque generalmente, más tiempo significa más oportunidades de detectar aves, aquí notamos algo especial. Después de alrededor de 3.5 horas, la probabilidad de detectar al zorzal disminuye.
+
+A continuación, esperamos a priori que cuanto mayor sea la distancia que recorra alguien, mayor será la probabilidad de encontrar al menos un Zorzal Bosque.
+
+```{r}
+# summarize data by 1 km bins
+breaks <- seq(0, 10)
+labels <- breaks[-length(breaks)] + diff(breaks) / 2
+checklists_dist <- checklists |> 
+  mutate(dist_bins = cut(effort_distance_km, 
+                         breaks = breaks, 
+                         labels = labels,
+                         include.lowest = TRUE),
+         dist_bins = as.numeric(as.character(dist_bins))) |> 
+  group_by(dist_bins) |> 
+  summarise(n_checklists = n(),
+            n_detected = sum(species_observed),
+            det_freq = mean(species_observed))
+
+# histogram
+g_dist_hist <- ggplot(checklists_dist) +
+  aes(x = dist_bins, y = n_checklists) +
+  geom_segment(aes(xend = dist_bins, y = 0, yend = n_checklists),
+               color = "grey50") +
+  geom_point() +
+  scale_x_continuous(breaks = breaks) +
+  scale_y_continuous(labels = scales::comma) +
+  labs(x = "Distance travelled [km]",
+       y = "# checklists",
+       title = "Distribution of distance travelled")
+
+# frequency of detection
+g_dist_freq <- ggplot(checklists_dist |> filter(n_checklists > 100)) +
+  aes(x = dist_bins, y = det_freq) +
+  geom_line() +
+  geom_point() +
+  scale_x_continuous(breaks = breaks) +
+  scale_y_continuous(labels = scales::percent) +
+  labs(x = "Distance travelled [km]",
+       y = "% checklists with detections",
+       title = "Detection frequency")
+
+# combine
+grid.arrange(g_dist_hist, g_dist_freq)
+```
+La mayoría de las observaciones provienen de listas de verificación cortas, es decir, donde las personas no caminan mucho, ¡menos de medio kilómetro!Y aquí hay algo afortunado: dado que la mayoría de las listas de verificación están en áreas pequeñas, podemos asumir que la variabilidad en el hábitat (el tipo de entorno natural) en esas áreas no es tan grande. Esto facilita nuestro trabajo al analizar y entender el hábitat.
+
+# No entendí el segundo gráfico
+Hay un aumento en la frecuencia de detección cuando se recorren mas kilometros.No entiendo porque cuando recorren menos que es la mayoria de las listas de verifcación hay una frecuencia de detección tan baja. 
+
+Lista de Verificación:
+
+¿Qué es?: Es un registro de todas las especies de aves que se observan en un lugar y momento específicos.
+
+Lista de Detección:
+
+¿Qué es?: Registra solo las especies de aves que fueron detectadas de manera segura y confirmada.
+
+A continuación hablaremos sobre el número de observadores: 
+
+Al principio, pensábamos que más amigos significaría más informes, descubrimos que hay un límite. Establecimos la regla de no considerar grupos con más de 30 amigos para que nuestros datos sean más confiables. ¡Así evitamos que los grupos muy grandes afecten nuestras conclusiones sobre las aves que están buscando!
+
+```{r}
+# summarize data
+breaks <- seq(0, 10)
+labels <- seq(1, 10)
+checklists_obs <- checklists |> 
+  mutate(obs_bins = cut(number_observers, 
+                        breaks = breaks, 
+                        label = labels,
+                        include.lowest = TRUE),
+         obs_bins = as.numeric(as.character(obs_bins))) |> 
+  group_by(obs_bins) |> 
+  summarise(n_checklists = n(),
+            n_detected = sum(species_observed),
+            det_freq = mean(species_observed))
+
+# histogram
+g_obs_hist <- ggplot(checklists_obs) +
+  aes(x = obs_bins, y = n_checklists) +
+  geom_segment(aes(xend = obs_bins, y = 0, yend = n_checklists),
+               color = "grey50") +
+  geom_point() +
+  scale_x_continuous(breaks = breaks) +
+  scale_y_continuous(labels = scales::comma) +
+  labs(x = "# observers",
+       y = "# checklists",
+       title = "Distribution of the number of observers")
+
+# frequency of detection
+g_obs_freq <- ggplot(checklists_obs |> filter(n_checklists > 100)) +
+  aes(x = obs_bins, y = det_freq) +
+  geom_line() +
+  geom_point() +
+  scale_x_continuous(breaks = breaks) +
+  scale_y_continuous(labels = scales::percent) +
+  labs(x = "# observers",
+       y = "% checklists with detections",
+       title = "Detection frequency")
+
+# combine
+grid.arrange(g_obs_hist, g_obs_freq)
+```
+La mayoría de las listas de verificación tienen uno o dos observadores y parece haber un aumento en la frecuencia de detección con más observadores. Sin embargo, es difícil distinguir un patrón discernible en el ruido aquí, probablemente porque hay muy pocas listas de verificación con más de 3 observadores.
+
+## Variables ambientales
+
+Los modelos de distribución de especies son como detectives que buscan pistas para entender dónde viven los animales y por qué. Usan información sobre el lugar donde se encuentran y cosas como la altura del terreno, la vegetación y el agua para prever dónde podrían estar en lugares que aún no han sido explorados.
+
+### Cobertura del suelo
+
+Usaremos datos especiales llamados "cobertura terrestre" para entender qué hay en cada parte del mapa.Estos datos provienen de algo llamado "MODIS MCD12Q1 v006", que es como un súper detector de cómo se ve la tierra desde arriba. Cubre todo el mundo y nos muestra detalles cada 500 metros.
+
+En R, usaremos el terrapaquete para trabajar con datos ráster.
+
+```{r}
+library(dplyr)
+library(exactextractr)
+library(landscapemetrics)
+library(readr)
+library(sf)
+library(stringr)
+library(terra)
+library(tidyr)
+library(units)
+library(viridis)
+
+# load and inspect the landcover data
+landcover <- rast("C:/Users/victo/OneDrive - PUJ Cali/Documentos/Maestría/2. Proyecto aplicado/Replica datos eBird/ebird-best-practices-data/data-raw/landcover_mcd12q1_umd_us-ga_2014-2022.tif")
+print(landcover)
+```
+
+
+```{r}
+# map the data for 2022
+plot(as.factor(landcover[["2022"]]), 
+     main = "MODIS Landcover 2022",
+     axes = FALSE)
+```
+La siguiente tabla sirve para comprender el mapa de la cobertura del suelo. 
+
+```{r}
+lc_classes <- read_csv("C:/Users/victo/OneDrive - PUJ Cali/Documentos/Maestría/2. Proyecto aplicado/Replica datos eBird/ebird-best-practices-data/data-raw/mcd12q1_umd_classes.csv")
+knitr::kable(lc_classes)
+```
+Las ubicaciones donde viste los pájaros a veces no son exactas, por lo que es mejor usar la información sobre cómo es el hábitat en el área cercana, no solo en ese punto específico. Para hacer esto, vamos a imaginar un círculo de 3 kilómetros de diámetro alrededor de cada lugar donde viste un pájaro. Existen muchas maneras de decir cómo es un vecindario, y en este caso, usaremos dos medidas sencillas: el porcentaje de tierra cubierta (pland), que nos dice qué tan común es cada tipo de paisaje (como bosques, pastizales o agua), y la densidad de bordes (ed), que nos dice cuánto borde hay entre esos lugares diferentes.
+
+```{r}
+# ebird checklist locations
+checklists <- read_csv("data/checklists-zf_woothr_jun_us-ga.csv") |> 
+  # landcover data not availble for the full period, so we use the closest year
+  mutate(year_lc = as.character(pmin(year, 2022)))
+
+# generate circular neighborhoods for all checklists
+checklists_sf <- checklists |> 
+  # identify unique location/year combinations
+  distinct(locality_id, year_lc, latitude, longitude) |> 
+  # generate a 3 km neighborhoods
+  st_as_sf(coords = c("longitude", "latitude"), crs = 4326)
+buffers <- st_buffer(checklists_sf, dist = set_units(1.5, "km"))
+```
+Después de encontrar esos lugares especiales y poner círculos mágicos alrededor de ellos, ahora queremos saber cómo es la tierra en esos círculos.Así que, para cada lugar especial, cortamos y cubrimos la información de cómo es la tierra (cobertura terrestre) que corresponde al mismo año en que se hizo la lista de aves. uego, usamos una herramienta llamada calculate_lsm() del paquete landscapemetrics. Es como un superpoder que nos ayuda a calcular dos cosas: el porcentaje de tierra cubierta (pland) y la densidad de bordes (edm) dentro de cada vecindario circular. 
+
+```{r}
+lsm <- NULL
+for (i in seq_len(nrow(buffers))) {
+  buffer_i <- st_transform(buffers[i, ], crs = crs(landcover))
+  year <- as.character(buffer_i$year_lc)
+  
+  # crop and mask landcover raster so all values outside buffer are missing
+  lsm[[i]] <- crop(landcover[[year]], buffer_i) |> 
+    mask(buffer_i) |> 
+    # calcualte landscape metrics
+    calculate_lsm(level = "class", metric = c("pland", "ed")) |> 
+    # add variables to uniquely identify each point
+    mutate(locality_id = buffer_i$locality_id, 
+           year_lc = buffer_i$year_lc) |> 
+    select(locality_id, year_lc, class, metric, value)
+}
+lsm <- bind_rows(lsm)
+```
+
+Hay un pequeño detalle: algunas clases de cobertura terrestre podrían no estar en la zona mágica alrededor de cada lugar. Entonces, para todas esas clases que no vimos en el vecindario, les diremos que su porcentaje de tierra cubierta y su densidad de bordes son cero, ¡como si no estuvieran allí!
+
+Además, en lugar de usar números extraños para hablar sobre las clases de cobertura terrestre, usaremos nombres mágicos que nos dirán exactamente qué tipo de terreno es. Y todo esto lo haremos gracias a un archivo especial que nos da nombres importantes para las clases de cobertura terrestre.
+
+```{r}
+lsm_wide <- lsm |> 
+  # fill missing classes with zeros
+  complete(nesting(locality_id, year_lc),
+           class = lc_classes$class,
+           metric = c("ed", "pland"),
+           fill = list(value = 0)) |> 
+  # bring in more descriptive names
+  inner_join(select(lc_classes, class, label), by = "class") |> 
+  # transform from long to wide format
+  pivot_wider(values_from = value,
+              names_from = c(class, label, metric),
+              names_glue = "{metric}_c{str_pad(class, 2, pad = '0')}_{label}",
+              names_sort = TRUE) |> 
+  arrange(locality_id, year_lc)
+```
+
+## Elevación
+
+Ahora, queremos entender cómo es la elevación del suelo, es decir, qué tan alto o bajo está el terreno. Esto es importante porque afecta dónde eligen vivir las aves.Calcularemos dos cosas mágicas para cada lugar especial: la media y la desviación estándar de la elevación en un vecindario circular de 3 km alrededor de cada lugar donde viste aves.
+
+```{r}
+# elevation raster
+elevation <- rast("C:/Users/victo/OneDrive - PUJ Cali/Documentos/Maestría/2. Proyecto aplicado/Replica datos eBird/ebird-best-practices-data/data-raw/elevation_gmted_1km_us-ga.tif")
+
+# mean and standard deviation within each circular neighborhood
+elev_buffer <- exact_extract(elevation, buffers, fun = c("mean", "stdev"),
+                             progress = FALSE) |> 
+  # add variables to uniquely identify each point
+  mutate(locality_id = buffers$locality_id, year_lc = buffers$year_lc) |> 
+  select(locality_id, year_lc, 
+         elevation_mean = mean,
+         elevation_sd = stdev)
+```
+
+Ahora, combinemos las variables de cobertura terrestre y elevación, unámoslas nuevamente a los datos de la lista de verificación y guárdelas para usarlas como predictores de modelos en los próximos capítulos.
+
+```{r}
+# combine elevation and landcover
+env_variables <- inner_join(elev_buffer, lsm_wide,
+                            by = c("locality_id", "year_lc"))
+
+# attach and expand to checklists
+env_variables <- checklists |> 
+  select(checklist_id, locality_id, year_lc) |> 
+  inner_join(env_variables, by = c("locality_id", "year_lc")) |> 
+  select(-locality_id, -year_lc)
+
+# save to csv, dropping any rows with missing variables
+write_csv(drop_na(env_variables), 
+          "data/environmental-variables_checklists_jun_us-ga.csv", 
+          na = "")
+```
+
+## Cuadrícula de predicción
+
+Ahora, queremos hacer predicciones para toda nuestra área de estudio, para hacer esto, necesitamos algo especial llamado "cuadrícula de predicción". Imagina que estás dividiendo todo el territorio en pequeños cuadros, como un gigantesco rompecabezas. Cada cuadro nos dirá cómo es el terreno en ese pedazo.
+
+```{r}
+# lambert's azimuthal equal area projection for georgia
+laea_crs <- st_crs("+proj=laea +lat_0=33.2 +lon_0=-83.7")
+
+# study region: georgia
+study_region <- read_sf("data/gis-data.gpkg", layer = "ne_states") |> 
+  filter(state_code == "US-GA") |> 
+  st_transform(crs = laea_crs)
+
+# create a raster template covering the region with 3 km resolution
+r <- rast(study_region, res = c(3000, 3000))
+
+# fill the raster with 1s inside the study region
+r <- rasterize(study_region, r, values = 1) |> 
+  setNames("study_region")
+
+# save for later use
+r <- writeRaster(r, "data/prediction-grid_us-ga.tif",
+                 overwrite = TRUE,
+                 gdal = "COMPRESS=DEFLATE")
+```
+
+A continuación, extraemos las coordenadas de los centros de las celdas del ráster que acabamos de crear, las convertimos en sfentidades de puntos y las almacenamos en zonas de influencia para generar vecindades circulares de 3 km.
+
+```{r}
+# generate neighborhoods for the prediction grid cell centers
+buffers_pg <- as.data.frame(r, cells = TRUE, xy = TRUE) |> 
+  select(cell_id = cell, x, y) |> 
+  st_as_sf(coords = c("x", "y"), crs = laea_crs, remove = FALSE) |> 
+  st_transform(crs = 4326) |> 
+  st_buffer(set_units(3, "km"))
+```
+
+Ahora podemos calcular las variables de cobertura terrestre y elevación exactamente como lo hicimos para las listas de eBird en las dos secciones anteriores.En este caso utilizamos el año más reciente de datos de cobertura terrestre (es decir, 2022).
+
+```{r}
+# estimate landscape metrics for each cell in the prediction grid
+lsm_pg <- NULL
+for (i in seq_len(nrow(buffers_pg))) {
+  buffer_i <- st_transform(buffers_pg[i, ], crs = crs(landcover))
+  
+  # crop and mask landcover raster so all values outside buffer are missing
+  lsm_pg[[i]] <- crop(landcover[["2022"]], buffer_i) |> 
+    mask(buffer_i) |> 
+    # calcualte landscape metrics
+    calculate_lsm(level = "class", metric = c("pland", "ed")) |> 
+    # add variable to uniquely identify each point
+    mutate(cell_id = buffer_i$cell_id) |> 
+    select(cell_id, class, metric, value)
+}
+lsm_pg <- bind_rows(lsm_pg)
+
+# transform to wide format
+lsm_wide_pg <- lsm_pg |> 
+  # fill missing classes with zeros
+  complete(cell_id,
+           class = lc_classes$class,
+           metric = c("ed", "pland"),
+           fill = list(value = 0)) |> 
+  # bring in more descriptive names
+  inner_join(select(lc_classes, class, label), by = "class") |> 
+  # transform from long to wide format
+  pivot_wider(values_from = value,
+              names_from = c(class, label, metric),
+              names_glue = "{metric}_c{str_pad(class, 2, pad = '0')}_{label}",
+              names_sort = TRUE,
+              values_fill = 0) |> 
+  arrange(cell_id)
+```
+
+Y ahora la media y la desviación estándar de elevación.
+
+```{r}
+elev_buffer_pg <- exact_extract(elevation, buffers_pg, 
+                                fun = c("mean", "stdev"),
+                                progress = FALSE) |> 
+  # add variables to uniquely identify each point
+  mutate(cell_id = buffers_pg$cell_id) |> 
+  select(cell_id, elevation_mean = mean, elevation_sd = stdev)
+```
+
+Finalmente, combinamos las variables de cobertura terrestre y elevación y las guardamos en CSV.
+
+```{r}
+# combine landcover and elevation
+env_variables_pg <- inner_join(elev_buffer_pg, lsm_wide_pg, by = "cell_id")
+
+# attach the xy coordinates of the cell centers
+env_variables_pg <- buffers_pg |> 
+  st_drop_geometry() |> 
+  select(cell_id, x, y) |> 
+  inner_join(env_variables_pg, by = "cell_id")
+
+# save as csv, dropping any rows with missing variables
+write_csv(drop_na(env_variables_pg),
+          "data/environmental-variables_prediction-grid_us-ga.csv", 
+          na = "")
+```
+
+Siempre podemos usar la plantilla ráster para convertir estas variables ambientales a un formato espacial, por ejemplo, si queremos mapearlas. Veamos cómo funciona esto para el porcentaje de cobertura de bosque caducifolio latifoliado (clase 4).
+
+```{r}
+forest_cover <- env_variables_pg |> 
+  # convert to spatial features
+  st_as_sf(coords = c("x", "y"), crs = laea_crs) |> 
+  # rasterize points
+  rasterize(r, field = "pland_c04_deciduous_broadleaf")
+
+# make a map
+par(mar = c(0.25, 0.25, 2, 0.25))
+plot(forest_cover, 
+     axes = FALSE, box = FALSE, col = viridis(10), 
+     main = "Deciduous Broadleaf Forest (% cover)")
+```
+
